@@ -141,6 +141,8 @@ mk_erofs_umount() {
 
 # workaround for Debian
 # In Debian /usr/sbin is not in PATH and some utilities in there are in use
+# Ensure linker64 is executable (required for magiskpolicy)
+chmod +x "$PWD/linker/linker64" 2>/dev/null || true
 [ -d /usr/sbin ] && export PATH="/usr/sbin:$PATH"
 # In Debian /etc/mtab is not exist
 [ -f /etc/mtab ] || sudo ln -s /proc/self/mounts /etc/mtab
@@ -340,10 +342,27 @@ if [ "$GAPPS_BRAND" != "none" ]; then
     python3 generateGappsLink.py "$ARCH" "$DOWNLOAD_DIR" "$DOWNLOAD_CONF_NAME" "$GAPPS_ZIP_NAME" || abort
 fi
 echo "Download Artifacts"
-if ! aria2c --no-conf --log-level=info --log="$DOWNLOAD_DIR/aria2_download.log" -x16 -s16 -j5 -c -R -m0 --async-dns=false --check-integrity=true --continue=true --allow-overwrite=true --conditional-get=true -d"$DOWNLOAD_DIR" -i"$DOWNLOAD_DIR/$DOWNLOAD_CONF_NAME"; then
-    echo "We have encountered an error while downloading files."
-    exit 1
+# --- MODIFIED: Skip aria2c, files already downloaded locally ---
+MISSING=0
+for f in "$WSA_ZIP_PATH" "$VCLibs_PATH" "$UWPVCLibs_PATH" "$xaml_PATH"; do
+    if [ ! -f "$f" ]; then
+        echo "MISSING: $f"
+        MISSING=1
+    fi
+done
+if [ "$GAPPS_BRAND" != "none" ]; then
+    [ -f "$GAPPS_PATH" ] || { echo "MISSING: $GAPPS_PATH"; MISSING=1; }
 fi
+if [ "$ROOT_SOL" = "kernelsu" ]; then
+    [ -f "$KERNELSU_PATH" ]    || { echo "MISSING: $KERNELSU_PATH"; MISSING=1; }
+    [ -f "$KERNELSU_APK_PATH" ] || { echo "MISSING: $KERNELSU_APK_PATH"; MISSING=1; }
+fi
+if [ "$ROOT_SOL" = "magisk" ]; then
+    [ -f "$MAGISK_PATH" ] || { echo "MISSING: $MAGISK_PATH"; MISSING=1; }
+fi
+[ "$MISSING" -eq 1 ] && { echo "Download step skipped but files are missing."; exit 1; }
+echo "All required files present, skipping download."
+# --- END MODIFICATION ---
 
 echo "Extract WSA"
 if [ -f "$WSA_ZIP_PATH" ]; then
@@ -440,7 +459,7 @@ elif [ "$SYSTEMIMAGES_FILE_SYSTEM_TYPE" = "ext4" ]; then
     echo -e "Remove read-only flag for read-only EXT4 image done\n"
 
     echo "Calculate the required space"
-    EXTRA_SIZE=10240
+    EXTRA_SIZE=204800
 
     SYSTEM_EXT_NEED_SIZE=$EXTRA_SIZE
     if [ -d "$WORK_DIR/gapps/system_ext" ]; then
@@ -594,7 +613,13 @@ EOF
     echo -e "Integrate Magisk done\n"
 elif [ "$ROOT_SOL" = "kernelsu" ]; then
     echo "Copy KernelSU kernel"
-    cp "$WORK_DIR/kernelsu/kernel" "$WORK_DIR/wsa/$ARCH/Tools/kernel"
+    if [ -n "$KERNEL_OVERRIDE" ] && [ -f "$KERNEL_OVERRIDE" ]; then
+        echo "Using KERNEL_OVERRIDE: $KERNEL_OVERRIDE"
+        cp "$KERNEL_OVERRIDE" "$WORK_DIR/wsa/$ARCH/Tools/kernel"
+        echo "kernel MD5: $(md5sum "$WORK_DIR/wsa/$ARCH/Tools/kernel" | cut -d' ' -f1)"
+    else
+        cp "$WORK_DIR/kernelsu/kernel" "$WORK_DIR/wsa/$ARCH/Tools/kernel"
+    fi
     echo -e "Copy KernelSU kernel done\n"
 fi
 
@@ -605,6 +630,94 @@ find "../$ARCH/system/priv-app/" -maxdepth 1 -mindepth 1 -printf '%P\n' | xargs 
 find "../$ARCH/system/priv-app/" -maxdepth 1 -mindepth 1 -printf '%P\n' | xargs -I placeholder sudo find "$SYSTEM_MNT/priv-app/placeholder" -exec chown root:root {} \;
 find "../$ARCH/system/priv-app/" -maxdepth 1 -mindepth 1 -printf '%P\n' | xargs -I placeholder sudo find "$SYSTEM_MNT/priv-app/placeholder" -exec setfattr -n security.selinux -v "u:object_r:system_file:s0" {} \; || abort
 echo -e "Add extra packages done\n"
+# === Houdini ARM translation integration ===
+if [ "$ARCH" = "x64" ] && [ -d "$(dirname "$PWD")/libhoudini" ]; then
+    echo "Integrate Houdini (ARM translation)"
+    H="$(dirname "$PWD")/libhoudini"
+
+    for f in "$H/bin/houdini" "$H/bin/houdini64" \
+             "$H/lib/libhoudini.so" "$H/lib64/libhoudini.so" \
+             "$H/etc/binfmt_misc/arm_exe" "$H/etc/binfmt_misc/arm_dyn" \
+             "$H/etc/binfmt_misc/arm64_exe" "$H/etc/binfmt_misc/arm64_dyn"; do
+        [ -f "$f" ] || abort "Houdini file missing: $f"
+    done
+
+    # /system/bin
+    sudo cp "$H/bin/houdini"   "$SYSTEM_MNT/bin/houdini"   || abort
+    sudo cp "$H/bin/houdini64" "$SYSTEM_MNT/bin/houdini64" || abort
+    sudo chown root:2000 "$SYSTEM_MNT/bin/houdini" "$SYSTEM_MNT/bin/houdini64" || abort
+    sudo chmod 755 "$SYSTEM_MNT/bin/houdini" "$SYSTEM_MNT/bin/houdini64" || abort
+    sudo setfattr -n security.selinux -v "u:object_r:system_file:s0" \
+        "$SYSTEM_MNT/bin/houdini" "$SYSTEM_MNT/bin/houdini64" || abort
+
+    # /vendor dirs
+    sudo mkdir -p "$VENDOR_MNT/etc/binfmt_misc" "$VENDOR_MNT/lib" "$VENDOR_MNT/lib64" \
+                  "$VENDOR_MNT/bin" "$VENDOR_MNT/lib/arm" "$VENDOR_MNT/lib64/arm64" || abort
+
+    # binfmt config
+    for f in arm_exe arm_dyn arm64_exe arm64_dyn; do
+        sudo cp "$H/etc/binfmt_misc/$f" "$VENDOR_MNT/etc/binfmt_misc/$f" || abort
+        sudo setfattr -n security.selinux -v "u:object_r:vendor_configs_file:s0" \
+            "$VENDOR_MNT/etc/binfmt_misc/$f" || abort
+    done
+
+    # libhoudini.so
+    sudo cp "$H/lib/libhoudini.so"   "$VENDOR_MNT/lib/libhoudini.so"   || abort
+    sudo cp "$H/lib64/libhoudini.so" "$VENDOR_MNT/lib64/libhoudini.so" || abort
+    sudo chown root:root "$VENDOR_MNT/lib/libhoudini.so" "$VENDOR_MNT/lib64/libhoudini.so" || abort
+    sudo chmod 644 "$VENDOR_MNT/lib/libhoudini.so" "$VENDOR_MNT/lib64/libhoudini.so" || abort
+    sudo setfattr -n security.selinux -v "u:object_r:same_process_hal_file:s0" \
+        "$VENDOR_MNT/lib/libhoudini.so" "$VENDOR_MNT/lib64/libhoudini.so" || abort
+
+    # /vendor/bin
+    sudo cp "$H/bin/houdini"   "$VENDOR_MNT/bin/houdini"   || abort
+    sudo cp "$H/bin/houdini64" "$VENDOR_MNT/bin/houdini64" || abort
+    sudo chown root:2000 "$VENDOR_MNT/bin/houdini" "$VENDOR_MNT/bin/houdini64" || abort
+    sudo chmod 755 "$VENDOR_MNT/bin/houdini" "$VENDOR_MNT/bin/houdini64" || abort
+    sudo setfattr -n security.selinux -v "u:object_r:same_process_hal_file:s0" \
+        "$VENDOR_MNT/bin/houdini" "$VENDOR_MNT/bin/houdini64" || abort
+
+    # ARM libs
+    if [ -d "$H/lib/arm" ]; then
+        sudo cp -r "$H/lib/arm/." "$VENDOR_MNT/lib/arm/" || abort
+        sudo find "$VENDOR_MNT/lib/arm" -type f -exec chown root:root {} \;
+        sudo find "$VENDOR_MNT/lib/arm" -type f -exec chmod 644 {} \;
+        sudo find "$VENDOR_MNT/lib/arm" -type f -exec setfattr -n security.selinux \
+            -v "u:object_r:same_process_hal_file:s0" {} \;
+    fi
+    if [ -d "$H/lib64/arm64" ]; then
+        sudo cp -r "$H/lib64/arm64/." "$VENDOR_MNT/lib64/arm64/" || abort
+        sudo find "$VENDOR_MNT/lib64/arm64" -type f -exec chown root:root {} \;
+        sudo find "$VENDOR_MNT/lib64/arm64" -type f -exec chmod 644 {} \;
+        sudo find "$VENDOR_MNT/lib64/arm64" -type f -exec setfattr -n security.selinux \
+            -v "u:object_r:same_process_hal_file:s0" {} \;
+    fi
+
+    # init.windows_x86_64.rc binfmt register
+    INIT_RC="$VENDOR_MNT/etc/init/init.windows_x86_64.rc"
+    if [ -f "$INIT_RC" ] && ! grep -q "binfmt_misc/register" "$INIT_RC"; then
+        sudo cp "$INIT_RC" "$INIT_RC.backup" || abort
+        TMP_RC="$WORK_DIR/init_win.rc"
+        sudo awk '
+        {
+            print $0
+            if ($0 ~ /mount none \/vendor\/bin\/houdini \/system\/bin\/houdini bind rec/) {
+                print "    exec -- /system/bin/sh -c \"echo :arm_exe:M::\\\\x7f\\\\x45\\\\x4c\\\\x46\\\\x01\\\\x01\\\\x01\\\\x00\\\\x00\\\\x00\\\\x00\\\\x00\\\\x00\\\\x00\\\\x00\\\\x00\\\\x02\\\\x00\\\\x28::/system/bin/houdini:P > /proc/sys/fs/binfmt_misc/register\""
+                print "    exec -- /system/bin/sh -c \"echo :arm_dyn:M::\\\\x7f\\\\x45\\\\x4c\\\\x46\\\\x01\\\\x01\\\\x01\\\\x00\\\\x00\\\\x00\\\\x00\\\\x00\\\\x00\\\\x00\\\\x00\\\\x00\\\\x03\\\\x00\\\\x28::/system/bin/houdini:P >> /proc/sys/fs/binfmt_misc/register\""
+            }
+            if ($0 ~ /mount none \/vendor\/bin\/houdini64 \/system\/bin\/houdini64 bind rec/) {
+                print "    exec -- /system/bin/sh -c \"echo :arm64_exe:M::\\\\x7f\\\\x45\\\\x4c\\\\x46\\\\x02\\\\x01\\\\x01\\\\x00\\\\x00\\\\x00\\\\x00\\\\x00\\\\x00\\\\x00\\\\x00\\\\x00\\\\x02\\\\x00\\\\xb7::/system/bin/houdini64:P >> /proc/sys/fs/binfmt_misc/register\""
+                print "    exec -- /system/bin/sh -c \"echo :arm64_dyn:M::\\\\x7f\\\\x45\\\\x4c\\\\x46\\\\x02\\\\x01\\\\x01\\\\x00\\\\x00\\\\x00\\\\x00\\\\x00\\\\x00\\\\x00\\\\x00\\\\x00\\\\x03\\\\x00\\\\xb7::/system/bin/houdini64:P >> /proc/sys/fs/binfmt_misc/register\""
+            }
+        }' "$INIT_RC" | sudo tee "$TMP_RC" > /dev/null
+        sudo mv "$TMP_RC" "$INIT_RC" || abort
+        sudo setfattr -n security.selinux -v "u:object_r:vendor_configs_file:s0" "$INIT_RC" || abort
+        sudo setfattr -n security.selinux -v "u:object_r:vendor_configs_file:s0" "$INIT_RC.backup" || abort
+    fi
+
+    echo -e "Integrate Houdini done\n"
+fi
+
 
 if [ "$GAPPS_BRAND" != 'none' ]; then
     echo "Integrate MindTheGapps"

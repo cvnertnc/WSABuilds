@@ -22,7 +22,7 @@ $Host.UI.RawUI.WindowTitle = "Installing MagiskOnWSA..."
 function Finish {
     Clear-Host
     Start-Process "shell:AppsFolder\MicrosoftCorporationII.WindowsSubsystemForAndroid_8wekyb3d8bbwe!SettingsApp"
-    Start-Process "wsa://com.topjohnwu.magisk"
+    Start-Process "https://github.com/MustardChef/WSABuilds/blob/585e9df757ed135dce504725c9e386a6ce6419ce/Documentation/Usage%20Guides/General%20Usage%20Guides/KernelSU.md"
     Start-Process "wsa://com.android.vending"
     Start-Process "wsa://com.android.settings"
 
